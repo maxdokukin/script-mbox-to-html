@@ -8,6 +8,7 @@ from email.header import decode_header
 from email.utils import parsedate_to_datetime
 
 # --- CONFIGURATION ---
+# Note: This is now dynamically overridden in main()
 OUTPUT_DIR_NAME = "Mac_Mail_Archive_3Col"
 
 RETRO_CSS = """
@@ -225,7 +226,10 @@ def main():
 
     if not os.path.exists(input_path): return print("Folder not found.")
 
-    output_path = os.path.join(os.path.dirname(input_path), OUTPUT_DIR_NAME)
+    # Apply required output dir name changes: original dir name + _html suffix
+    output_dir_name = os.path.basename(input_path.rstrip(os.sep)) + "_html"
+    output_path = os.path.join(os.path.dirname(input_path), output_dir_name)
+
     if os.path.exists(output_path): shutil.rmtree(output_path)
     data_dir = os.path.join(output_path, "data")
     os.makedirs(data_dir)
