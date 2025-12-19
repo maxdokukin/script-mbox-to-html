@@ -6,13 +6,15 @@ import re
 import mimetypes
 import hashlib
 import datetime
+import base64
+import binascii
 from email.header import decode_header
 from email.utils import parsedate_to_datetime
 
 # --- CONFIGURATION ---
-OUTPUT_DIR_NAME = "Mac_Mail_Archive_Strict_Threaded"
-TIME_MERGE_WINDOW_DAYS = 45  # Merge threads by subject if within this many days
+OUTPUT_DIR_NAME = "Mac_Mail_Archive_Strict_Debug"
 
+# CSS (No changes)
 RETRO_CSS = """
 <style>
     :root {
@@ -186,13 +188,6 @@ def is_image(filename):
     return guess and guess.startswith('image')
 
 
-def normalize_subject(subj):
-    # Aggressive normalization for grouping
-    s = subj.lower()
-    s = re.sub(r'^\s*(re|fwd|fw|aw|antw|wg|sv)(\[\d+\])?:\s*', '', s).strip()
-    return s if s else "no_subject"
-
-
 def parse_date_strict(date_str):
     if not date_str: return datetime.datetime.min.replace(tzinfo=datetime.timezone.utc)
     try:
@@ -229,6 +224,23 @@ def extract_references(msg):
             unique_refs.append(r)
             seen.add(r)
     return unique_refs
+
+
+def extract_thread_index(msg):
+    """
+    Extracts the Microsoft/Exchange Thread-Index.
+    This is a base64 string. The first 22 bytes (30 chars) are the GUID for the conversation.
+    """
+    ti = msg.get('Thread-Index', '').strip()
+    if not ti: return None
+
+    # We only care about the conversation ID (first 30 chars/22 bytes)
+    # This groups "RE: Hello" and "FW: Hello" even if subjects change
+    try:
+        # Just return the raw string prefix as a grouping key
+        return ti[:30]
+    except:
+        return None
 
 
 def extract_content(msg, attachment_dir):
@@ -268,11 +280,6 @@ def extract_content(msg, attachment_dir):
 # --- CORE THREADING CLASSES ---
 
 class Node:
-    """
-    Represents a single node in the thread tree.
-    Can be a 'Ghost' (missing message) or a 'Real' message.
-    """
-
     def __init__(self, msg_id):
         self.msg_id = msg_id
         self.message = None  # None = Ghost
@@ -291,7 +298,6 @@ class Node:
         return curr
 
     def walk(self):
-        # Return all messages in subtree (pre-order)
         result = []
         if self.message: result.append(self.message)
         for child in self.children:
@@ -301,21 +307,20 @@ class Node:
     @property
     def date(self):
         if self.message: return self.message['dt']
-        # If ghost, try to infer date from children (min of children)
         dates = [c.date for c in self.children]
         if dates: return min(dates)
         return datetime.datetime.min.replace(tzinfo=datetime.timezone.utc)
 
 
 def main():
-    print("--- Strict Graph Threading Engine (JWZ Implementation) ---")
+    print("--- DEBUG GRAPH THREADING ENGINE (STRICT) ---")
     raw_input = input("Drag and drop your 'Mail Export' folder here: ").strip()
     input_path = raw_input.strip("'").strip('"')
 
     if not os.path.exists(input_path): return print("Folder not found.")
 
     original_folder_name = os.path.basename(input_path.rstrip(os.sep))
-    output_path = os.path.join(os.path.dirname(input_path), f"{original_folder_name}_Strict_Threaded")
+    output_path = os.path.join(os.path.dirname(input_path), f"{original_folder_name}_Debug_Threaded")
 
     if os.path.exists(output_path): shutil.rmtree(output_path)
     data_dir = os.path.join(output_path, "data")
@@ -323,12 +328,12 @@ def main():
 
     # Global Lookups
     nodes = {}  # msg_id -> Node
+    thread_index_map = {}  # thread_index_prefix -> Node (Root or parent of that thread)
     folder_counts = {}
-
     msg_counter = 0
 
     # --- PHASE 1: INGEST AND CREATE NODES ---
-    print("Phase 1: Ingesting Messages...")
+    print("\n[PHASE 1] Ingesting Messages & Extracting IDs...")
 
     for root, _, _ in os.walk(input_path):
         if root.endswith(".mbox") and os.path.exists(os.path.join(root, "mbox")):
@@ -341,18 +346,23 @@ def main():
                     msg_counter += 1
                     local_id = f"m{msg_counter}"
 
-                    # 1. Parse Headers
+                    # Data Extraction
                     subj = decode_header_safe(msg.get('subject', '(No Subject)'))
-                    norm_subj = normalize_subject(subj)
                     date_str = decode_header_safe(msg.get('date', ''))
                     dt_obj = parse_date_strict(date_str)
                     mid = extract_msg_id(msg)
+                    refs = extract_references(msg)
+                    ti = extract_thread_index(msg)
 
-                    # 2. Extract Body (to disk immediately)
+                    # --- DEBUG PRINT ---
+                    if msg_counter % 100 == 0: print(f"Processing {msg_counter}...")
+                    # print(f"[DEBUG] Msg: {subj[:30]}... | ID: {mid} | Refs: {len(refs)} | Thread-Index: {ti}")
+
+                    # Save Body
                     att_dir = os.path.join(data_dir, f"{local_id}_att")
                     body, atts = extract_content(msg, att_dir)
 
-                    # Store HTML Fragment
+                    # HTML Frag (Same as before)
                     att_html = ""
                     if atts:
                         links = "".join([
@@ -371,6 +381,7 @@ def main():
                             <div class="email-meta"><b>From:</b> {html.escape(decode_header_safe(msg.get('from', 'Unknown')))}</div>
                             <div class="email-meta"><b>Folder:</b> {html.escape(folder_name)}</div>
                             <div class="email-meta"><b>Subject:</b> {html.escape(subj)}</div>
+                            <div class="email-meta" style="font-size:10px; color:#999;"><b>Debug ID:</b> {mid}</div>
                         </div>
                         <div class="email-body" style="padding:15px;">{att_html}{body}</div>
                     </div>
@@ -379,8 +390,7 @@ def main():
                     with open(os.path.join(data_dir, f"{local_id}.frag"), "w", encoding="utf-8") as f:
                         f.write(content_fragment)
 
-                    # 3. Create Node
-                    # If ID missing, create synthetic ID based on hash of subject+date
+                    # Create Node
                     if not mid:
                         hasher = hashlib.md5()
                         hasher.update((subj + str(dt_obj.timestamp())).encode('utf-8'))
@@ -389,125 +399,109 @@ def main():
                     if mid not in nodes:
                         nodes[mid] = Node(mid)
 
-                    # Populate Node
-                    msg_data = {
+                    # Store Data
+                    nodes[mid].message = {
                         'local_id': local_id,
                         'mid': mid,
                         'subj': subj,
-                        'norm_subj': norm_subj,
                         'date_str': date_str,
                         'dt': dt_obj,
                         'sender': decode_header_safe(msg.get('from', '')),
                         'folder': folder_name,
-                        'refs': extract_references(msg)
+                        'refs': refs,
+                        'thread_index': ti
                     }
-                    nodes[mid].message = msg_data
 
             except Exception as e:
-                print(f"Skipping corrupt message in {folder_name}: {e}")
+                print(f"Skipping corrupt message: {e}")
 
-    # --- PHASE 2: LINKING (BUILDING TREES) ---
-    print("Phase 2: Linking Nodes via Headers...")
+    # --- PHASE 2: STRICT LINKING (NO FUZZY SUBJECTS) ---
+    print("\n[PHASE 2] Linking via References & Thread-Index...")
 
-    # FIX: Iterate over a copy (list) of items to safely add Ghost Nodes during iteration
+    # 1. Standard JWZ (References)
+    # We iterate a copy to allow adding ghosts safely
     for mid, node in list(nodes.items()):
-        if not node.message: continue  # Skip ghosts during iteration
+        if not node.message: continue
 
         refs = node.message['refs']
-        if not refs: continue
 
-        # Link to the LAST existing reference (standard threading behavior)
-        # Note: We must create ghosts for refs that don't exist yet
-        prev = None
-        for ref_id in refs:
-            if ref_id not in nodes:
-                nodes[ref_id] = Node(ref_id)  # Create Ghost
+        if refs:
+            print(f"[DEBUG-LINK] '{node.message['subj'][:20]}' ({mid}) has {len(refs)} refs.")
 
-            curr = nodes[ref_id]
-            if prev and not curr.parent and prev != curr:
-                # Chain: Ref1 -> Ref2 -> Ref3
-                prev.add_child(curr)
-            prev = curr
+            # Ensure chain exists
+            prev = None
+            for r in refs:
+                if r not in nodes:
+                    nodes[r] = Node(r)  # Create Ghost
 
-        # Link current message to the last ref
-        last_ref = nodes[refs[-1]]
-        if last_ref != node and not node.parent:
-            last_ref.add_child(node)
+                curr = nodes[r]
+                if prev and not curr.parent and prev != curr:
+                    print(f"   -> Chaining Ref {prev.msg_id} -> {curr.msg_id}")
+                    prev.add_child(curr)
+                prev = curr
 
-    # --- PHASE 3: SUBJECT MERGING (FIXING BROKEN HEADERS) ---
-    print("Phase 3: Merging by Subject (Time-Aware)...")
+            # Link current to last ref
+            last_ref = nodes[refs[-1]]
+            if last_ref != node and not node.parent:
+                print(f"   -> Linking Message to Parent {last_ref.msg_id}")
+                last_ref.add_child(node)
 
-    # Identify current roots
-    roots = [n for n in nodes.values() if n.parent is None]
+    # 2. Microsoft Thread-Index (The "Missing Data" Fix)
+    # This groups messages that share the same conversation GUID but lost their References
+    print("\n[PHASE 2.5] Linking via Thread-Index (Outlook Grouping)...")
 
-    # Group roots by Normalized Subject
-    subj_buckets = {}
-    for r in roots:
-        # If ghost root, try to get subject from first child
-        subj = ""
-        if r.message:
-            subj = r.message['norm_subj']
-        elif r.children:
-            # Find first child with message
-            q = [r]
-            while q:
-                curr = q.pop(0)
-                if curr.message:
-                    subj = curr.message['norm_subj']
-                    break
-                q.extend(curr.children)
+    # Bucket by Thread-Index prefix
+    ti_buckets = {}
+    for mid, node in nodes.items():
+        if node.message and node.message['thread_index']:
+            ti = node.message['thread_index']
+            if ti not in ti_buckets: ti_buckets[ti] = []
+            ti_buckets[ti].append(node)
 
-        if not subj: continue
+    for ti, node_list in ti_buckets.items():
+        if len(node_list) < 2: continue
 
-        if subj not in subj_buckets: subj_buckets[subj] = []
-        subj_buckets[subj].append(r)
+        # Sort by date
+        node_list.sort(key=lambda x: x.date)
 
-    # Merge roots within buckets if temporally close
-    for subj, root_list in subj_buckets.items():
-        if len(root_list) < 2: continue
+        # We have a list of messages that DEFINITELY belong together (cryptographically linked)
+        # If they aren't already linked via References, link them now chronologically.
+        for i in range(len(node_list) - 1):
+            parent = node_list[i]
+            child = node_list[i + 1]
 
-        # Sort roots by date
-        root_list.sort(key=lambda x: x.date)
+            # Only link if child is orphan (or we are repairing a broken tree)
+            if not child.parent and child != parent:
+                # Check if they are already in the same tree?
+                # Actually, if they share a TI, they ARE the same thread.
+                # If 'child' has no parent, attach to 'parent'.
+                print(
+                    f"[DEBUG-MS-LINK] Linking via Thread-Index: {child.message['subj'][:20]} -> {parent.message['subj'][:20]}")
+                parent.add_child(child)
 
-        # Try to chain them: Root1 -> Root2 if Root2 is close to Root1
-        for i in range(len(root_list) - 1):
-            parent = root_list[i]
-            child = root_list[i + 1]
-
-            # Check time delta
-            if (child.date - parent.date).days < TIME_MERGE_WINDOW_DAYS:
-                # Merge: Make 'child' a child of 'parent'
-                if child != parent:
-                    parent.add_child(child)
+    # --- PHASE 3: REMOVED (NO SUBJECT MERGING) ---
+    print("\n[PHASE 3] Subject Merging DISABLED (Preventing 'Stacking')...")
 
     # --- PHASE 4: FLATTEN & SORT ---
-    print("Phase 4: Generating Thread Views...")
+    print("\n[PHASE 4] Generating Thread Views...")
 
-    # Re-fetch roots after merging
     final_roots = [n for n in nodes.values() if n.parent is None]
-
     final_threads = []
-
     thread_id_counter = 0
 
     for root in final_roots:
-        # Flatten tree
         msgs = root.walk()
-        if not msgs: continue  # Empty ghost tree
+        if not msgs: continue
 
-        # 1. Sort Messages INSIDE Thread: Oldest First
         msgs.sort(key=lambda x: x['dt'])
 
-        # 2. Determine Participating Folders
         folders = set(m['folder'] for m in msgs)
         folders_str = "||".join(sorted(folders))
 
-        # 3. Thread Metadata
-        latest_msg = msgs[-1]  # Newest message defines the thread details
+        latest_msg = msgs[-1]
         thread_id_counter += 1
         tid = f"t{thread_id_counter}"
 
-        # 4. Build HTML
         html_content = ""
         for m in msgs:
             fpath = os.path.join(data_dir, f"{m['local_id']}.frag")
@@ -536,12 +530,11 @@ def main():
             'subj': latest_msg['subj'],
             'sender': latest_msg['sender'],
             'date_str': latest_msg['date_str'],
-            'sort_dt': latest_msg['dt'],  # Sort thread by NEWEST message date
+            'sort_dt': latest_msg['dt'],
             'folders': folders_str,
             'count': len(msgs)
         })
 
-    # 5. Sort THREADS by Newest Activity (Descending)
     final_threads.sort(key=lambda x: x['sort_dt'], reverse=True)
 
     # --- PHASE 5: INDEX HTML ---
@@ -616,7 +609,7 @@ def main():
     with open(os.path.join(output_path, "index.html"), "w", encoding="utf-8") as f:
         f.write(index_html)
 
-    print(f"Done! Created strict threaded archive at: {output_path}")
+    print(f"Done! Created STRICT archive at: {output_path}")
 
 
 if __name__ == "__main__":
