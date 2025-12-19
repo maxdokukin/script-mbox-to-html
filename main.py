@@ -4,12 +4,14 @@ import html
 import mailbox
 import re
 import mimetypes
+import hashlib
+import datetime
 from email.header import decode_header
 from email.utils import parsedate_to_datetime
 
 # --- CONFIGURATION ---
-# Note: This is now dynamically overridden in main()
-OUTPUT_DIR_NAME = "Mac_Mail_Archive_3Col"
+OUTPUT_DIR_NAME = "Mac_Mail_Archive_Strict_Threaded"
+TIME_MERGE_WINDOW_DAYS = 45  # Merge threads by subject if within this many days
 
 RETRO_CSS = """
 <style>
@@ -18,8 +20,6 @@ RETRO_CSS = """
         --mac-white: #ffffff;
         --mac-grey: #cccccc;
         --mac-border: 2px solid #000;
-        --mac-highlight: #000000;
-        --mac-highlight-text: #ffffff;
     }
     * { box-sizing: border-box; }
     body, html {
@@ -31,7 +31,6 @@ RETRO_CSS = """
         background-size: 4px 4px;
         overflow: hidden;
     }
-
     .window {
         display: flex;
         flex-direction: column;
@@ -40,8 +39,6 @@ RETRO_CSS = """
         background: var(--mac-white);
         border: var(--mac-border);
     }
-
-    /* TITLE BAR */
     .title-bar {
         height: 30px;
         border-bottom: var(--mac-border);
@@ -59,15 +56,11 @@ RETRO_CSS = """
         font-weight: bold;
         font-size: 13px;
     }
-
-    /* 3-COLUMN LAYOUT */
     .main-view {
         display: flex;
         flex: 1;
         overflow: hidden;
     }
-
-    /* COL 1: SIDEBAR (Folders) */
     .sidebar {
         width: 220px;
         min-width: 200px;
@@ -87,8 +80,6 @@ RETRO_CSS = """
     }
     .folder-item:hover { background: #ccc; }
     .folder-item.active { background: #000; color: #fff; }
-
-    /* COL 2: LIST (Emails) */
     .list-pane {
         width: 350px;
         min-width: 300px;
@@ -103,16 +94,31 @@ RETRO_CSS = """
         border-bottom: 1px solid #ddd;
         padding: 8px;
         font-size: 12px;
+        display: flex;
+        flex-direction: column;
     }
     .mail-row:hover { background: #f0f0f0; }
     .mail-row.selected { background: #000; color: #fff; }
-
-    .mail-row-sender { font-weight: bold; margin-bottom: 2px; }
-    .mail-row-subject { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-    .mail-row-date { font-size: 10px; color: #666; float: right; }
+    .mail-row-header { display: flex; justify-content: space-between; margin-bottom: 4px; }
+    .mail-row-sender { font-weight: bold; }
+    .mail-row-date { font-size: 10px; color: #666; }
     .mail-row.selected .mail-row-date { color: #ccc; }
-
-    /* COL 3: READING PANE */
+    .mail-row-subject { 
+        white-space: nowrap; 
+        overflow: hidden; 
+        text-overflow: ellipsis; 
+    }
+    .thread-count {
+        background: #ccc;
+        color: #000;
+        border-radius: 8px;
+        padding: 0 5px;
+        font-size: 9px;
+        margin-left: 5px;
+        font-weight: bold;
+        display: inline-block;
+    }
+    .mail-row.selected .thread-count { background: #fff; color: #000; }
     .preview-pane {
         flex: 1;
         background: #fff;
@@ -132,10 +138,8 @@ RETRO_CSS = """
         width: 100%;
         height: 100%;
         border: none;
-        display: none; /* Hidden until loaded */
+        display: none;
     }
-
-    /* SCROLLBARS (Webkit) */
     ::-webkit-scrollbar { width: 10px; }
     ::-webkit-scrollbar-track { background: #fff; border-left: 1px solid #000; }
     ::-webkit-scrollbar-thumb { background: url('data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAQAAAAECAYAAACp8Z5+AAAAIklEQVQIW2NkQAKrVq36zwjjgzjIHFBmAAxxDatWrfoPAQA7YAxbHYyPOAAAAABJRU5ErkJggg=='); border: 1px solid #000; }
@@ -143,7 +147,7 @@ RETRO_CSS = """
 """
 
 
-# --- EMAIL HEADER FIXES ---
+# --- UTILITIES ---
 def safe_decode(text_bytes, encodings=['utf-8', 'windows-1251', 'koi8-r', 'latin1']):
     if not text_bytes: return ""
     for enc in encodings:
@@ -182,6 +186,51 @@ def is_image(filename):
     return guess and guess.startswith('image')
 
 
+def normalize_subject(subj):
+    # Aggressive normalization for grouping
+    s = subj.lower()
+    s = re.sub(r'^\s*(re|fwd|fw|aw|antw|wg|sv)(\[\d+\])?:\s*', '', s).strip()
+    return s if s else "no_subject"
+
+
+def parse_date_strict(date_str):
+    if not date_str: return datetime.datetime.min.replace(tzinfo=datetime.timezone.utc)
+    try:
+        dt = parsedate_to_datetime(date_str)
+        if dt.tzinfo is None: dt = dt.replace(tzinfo=datetime.timezone.utc)
+        return dt
+    except:
+        return datetime.datetime.min.replace(tzinfo=datetime.timezone.utc)
+
+
+def extract_msg_id(msg):
+    mid = msg.get('Message-ID', '').strip()
+    if mid.startswith('<') and mid.endswith('>'): mid = mid[1:-1]
+    return mid
+
+
+def extract_references(msg):
+    refs = []
+    # 1. References
+    ref_header = msg.get('References', '')
+    if ref_header:
+        found = re.findall(r'<([^>]+)>', ref_header)
+        refs.extend(found)
+    # 2. In-Reply-To
+    irt_header = msg.get('In-Reply-To', '')
+    if irt_header:
+        found = re.findall(r'<([^>]+)>', irt_header)
+        refs.extend(found)
+
+    seen = set()
+    unique_refs = []
+    for r in refs:
+        if r and r not in seen:
+            unique_refs.append(r)
+            seen.add(r)
+    return unique_refs
+
+
 def extract_content(msg, attachment_dir):
     body, attachments = "", []
     if not os.path.exists(attachment_dir): os.makedirs(attachment_dir)
@@ -190,7 +239,6 @@ def extract_content(msg, attachment_dir):
         for part in msg.walk():
             fname = part.get_filename()
             ctype = part.get_content_type()
-
             if fname or "image" in ctype:
                 if not fname: fname = f"embedded_{len(attachments)}" + (mimetypes.guess_extension(ctype) or ".bin")
                 safe_name = clean_filename(fname)
@@ -199,11 +247,10 @@ def extract_content(msg, attachment_dir):
                     with open(os.path.join(attachment_dir, safe_name), "wb") as f: f.write(payload)
                     attachments.append({"name": safe_name, "is_image": is_image(safe_name)})
                 continue
-
             try:
                 payload = part.get_payload(decode=True)
                 if payload:
-                    decoded = safe_decode(payload, [part.get_content_charset() or 'utf-8', 'windows-1251', 'koi8-r'])
+                    decoded = safe_decode(payload, [part.get_content_charset() or 'utf-8'])
                     if ctype == "text/html":
                         body = decoded
                     elif ctype == "text/plain" and not body:
@@ -213,103 +260,307 @@ def extract_content(msg, attachment_dir):
     else:
         payload = msg.get_payload(decode=True)
         if payload:
-            decoded = safe_decode(payload, [msg.get_content_charset() or 'utf-8', 'windows-1251', 'koi8-r'])
+            decoded = safe_decode(payload, [msg.get_content_charset() or 'utf-8'])
             body = decoded if msg.get_content_type() == "text/html" else f"<pre>{html.escape(decoded)}</pre>"
-
     return body, attachments
 
 
+# --- CORE THREADING CLASSES ---
+
+class Node:
+    """
+    Represents a single node in the thread tree.
+    Can be a 'Ghost' (missing message) or a 'Real' message.
+    """
+
+    def __init__(self, msg_id):
+        self.msg_id = msg_id
+        self.message = None  # None = Ghost
+        self.parent = None
+        self.children = []
+
+    def add_child(self, child_node):
+        if child_node.parent: return  # Already attached
+        child_node.parent = self
+        self.children.append(child_node)
+
+    def get_root(self):
+        curr = self
+        while curr.parent:
+            curr = curr.parent
+        return curr
+
+    def walk(self):
+        # Return all messages in subtree (pre-order)
+        result = []
+        if self.message: result.append(self.message)
+        for child in self.children:
+            result.extend(child.walk())
+        return result
+
+    @property
+    def date(self):
+        if self.message: return self.message['dt']
+        # If ghost, try to infer date from children (min of children)
+        dates = [c.date for c in self.children]
+        if dates: return min(dates)
+        return datetime.datetime.min.replace(tzinfo=datetime.timezone.utc)
+
+
 def main():
-    print("---  Mac Mail 3-Pane Exporter ---")
+    print("--- Strict Graph Threading Engine (JWZ Implementation) ---")
     raw_input = input("Drag and drop your 'Mail Export' folder here: ").strip()
     input_path = raw_input.strip("'").strip('"')
 
     if not os.path.exists(input_path): return print("Folder not found.")
 
-    # Apply required output dir name changes: original dir name + _html suffix
-    output_dir_name = os.path.basename(input_path.rstrip(os.sep)) + "_html"
-    output_path = os.path.join(os.path.dirname(input_path), output_dir_name)
+    original_folder_name = os.path.basename(input_path.rstrip(os.sep))
+    output_path = os.path.join(os.path.dirname(input_path), f"{original_folder_name}_Strict_Threaded")
 
     if os.path.exists(output_path): shutil.rmtree(output_path)
     data_dir = os.path.join(output_path, "data")
     os.makedirs(data_dir)
 
-    all_emails = []
+    # Global Lookups
+    nodes = {}  # msg_id -> Node
     folder_counts = {}
 
-    for root, dirs, files in os.walk(input_path):
+    msg_counter = 0
+
+    # --- PHASE 1: INGEST AND CREATE NODES ---
+    print("Phase 1: Ingesting Messages...")
+
+    for root, _, _ in os.walk(input_path):
         if root.endswith(".mbox") and os.path.exists(os.path.join(root, "mbox")):
             folder_name = os.path.relpath(root, input_path).replace(".mbox", "")
-            print(f"Processing: {folder_name}...")
-            folder_counts[folder_name] = 0
+            if folder_name not in folder_counts: folder_counts[folder_name] = 0
 
             try:
                 for msg in mailbox.mbox(os.path.join(root, "mbox")):
                     folder_counts[folder_name] += 1
-                    email_id = f"msg_{len(all_emails)}"
+                    msg_counter += 1
+                    local_id = f"m{msg_counter}"
 
+                    # 1. Parse Headers
                     subj = decode_header_safe(msg.get('subject', '(No Subject)'))
-                    sender = decode_header_safe(msg.get('from', 'Unknown'))
-                    date = decode_header_safe(msg.get('date', ''))
+                    norm_subj = normalize_subject(subj)
+                    date_str = decode_header_safe(msg.get('date', ''))
+                    dt_obj = parse_date_strict(date_str)
+                    mid = extract_msg_id(msg)
 
-                    # Generate Email File
-                    att_dir = os.path.join(data_dir, f"{email_id}_att")
+                    # 2. Extract Body (to disk immediately)
+                    att_dir = os.path.join(data_dir, f"{local_id}_att")
                     body, atts = extract_content(msg, att_dir)
 
+                    # Store HTML Fragment
                     att_html = ""
                     if atts:
                         links = "".join([
-                                            f"<li><a href='{email_id}_att/{a['name']}' target='_blank'>{html.escape(a['name'])}</a></li>"
+                                            f"<li><a href='{local_id}_att/{a['name']}' target='_blank'>{html.escape(a['name'])}</a></li>"
                                             for a in atts if not a['is_image']])
                         imgs = "".join([
-                                           f"<img src='{email_id}_att/{a['name']}' style='max-width:100%; border:1px solid #000; margin:10px 0;'>"
+                                           f"<img src='{local_id}_att/{a['name']}' style='max-width:100%; border:1px solid #000; margin:10px 0;'>"
                                            for a in atts if a['is_image']])
-                        if links: att_html += f"<div style='border:1px dashed #000; padding:10px; background:#eee;'><b>Attachments:</b><ul>{links}</ul></div>"
+                        if links: att_html += f"<div style='border:1px dashed #000; padding:10px; background:#eee; margin-bottom:10px;'><b>Attachments:</b><ul>{links}</ul></div>"
                         if imgs: att_html += f"<div>{imgs}</div>"
 
-                    # Email HTML Template (Embedded in iframe)
-                    with open(os.path.join(data_dir, f"{email_id}.html"), "w", encoding="utf-8") as f:
-                        f.write(f"""
-                        <!DOCTYPE html><html><head><meta charset="UTF-8">
-                        <style>
-                            body {{ font-family: "Geneva", sans-serif; padding: 20px; font-size: 14px; }}
-                            .header {{ border-bottom: 2px solid black; padding-bottom: 10px; margin-bottom: 20px; background: #f9f9f9; padding: 15px; }}
-                            h2 {{ margin: 0 0 10px 0; font-size: 18px; }}
-                            .meta {{ color: #555; margin-bottom: 5px; }}
-                            pre {{ white-space: pre-wrap; font-family: Courier; }}
-                        </style>
-                        </head><body>
-                        <div class="header">
-                            <h2>{html.escape(subj)}</h2>
-                            <div class="meta"><b>From:</b> {html.escape(sender)}</div>
-                            <div class="meta"><b>Date:</b> {html.escape(date)}</div>
+                    content_fragment = f"""
+                    <div class="email-container" id="{local_id}" style="border:1px solid #ccc; margin-bottom:20px;">
+                        <div class="email-header" style="background:#f4f4f4; padding:8px; border-bottom:1px solid #ddd;">
+                            <div style="float:right; font-size:11px; color:#666;">{html.escape(date_str)}</div>
+                            <div class="email-meta"><b>From:</b> {html.escape(decode_header_safe(msg.get('from', 'Unknown')))}</div>
+                            <div class="email-meta"><b>Folder:</b> {html.escape(folder_name)}</div>
+                            <div class="email-meta"><b>Subject:</b> {html.escape(subj)}</div>
                         </div>
-                        {att_html}
-                        <div>{body}</div>
-                        </body></html>
-                        """)
+                        <div class="email-body" style="padding:15px;">{att_html}{body}</div>
+                    </div>
+                    """
 
-                    all_emails.append({
-                        "id": email_id, "folder": folder_name, "subj": subj, "sender": sender, "date": date
-                    })
+                    with open(os.path.join(data_dir, f"{local_id}.frag"), "w", encoding="utf-8") as f:
+                        f.write(content_fragment)
+
+                    # 3. Create Node
+                    # If ID missing, create synthetic ID based on hash of subject+date
+                    if not mid:
+                        hasher = hashlib.md5()
+                        hasher.update((subj + str(dt_obj.timestamp())).encode('utf-8'))
+                        mid = f"synth_{hasher.hexdigest()}"
+
+                    if mid not in nodes:
+                        nodes[mid] = Node(mid)
+
+                    # Populate Node
+                    msg_data = {
+                        'local_id': local_id,
+                        'mid': mid,
+                        'subj': subj,
+                        'norm_subj': norm_subj,
+                        'date_str': date_str,
+                        'dt': dt_obj,
+                        'sender': decode_header_safe(msg.get('from', '')),
+                        'folder': folder_name,
+                        'refs': extract_references(msg)
+                    }
+                    nodes[mid].message = msg_data
+
             except Exception as e:
-                print(f"Error reading {folder_name}: {e}")
+                print(f"Skipping corrupt message in {folder_name}: {e}")
 
-    # --- GENERATE INDEX.HTML ---
+    # --- PHASE 2: LINKING (BUILDING TREES) ---
+    print("Phase 2: Linking Nodes via Headers...")
 
-    # Sort folders alphabetically
+    # FIX: Iterate over a copy (list) of items to safely add Ghost Nodes during iteration
+    for mid, node in list(nodes.items()):
+        if not node.message: continue  # Skip ghosts during iteration
+
+        refs = node.message['refs']
+        if not refs: continue
+
+        # Link to the LAST existing reference (standard threading behavior)
+        # Note: We must create ghosts for refs that don't exist yet
+        prev = None
+        for ref_id in refs:
+            if ref_id not in nodes:
+                nodes[ref_id] = Node(ref_id)  # Create Ghost
+
+            curr = nodes[ref_id]
+            if prev and not curr.parent and prev != curr:
+                # Chain: Ref1 -> Ref2 -> Ref3
+                prev.add_child(curr)
+            prev = curr
+
+        # Link current message to the last ref
+        last_ref = nodes[refs[-1]]
+        if last_ref != node and not node.parent:
+            last_ref.add_child(node)
+
+    # --- PHASE 3: SUBJECT MERGING (FIXING BROKEN HEADERS) ---
+    print("Phase 3: Merging by Subject (Time-Aware)...")
+
+    # Identify current roots
+    roots = [n for n in nodes.values() if n.parent is None]
+
+    # Group roots by Normalized Subject
+    subj_buckets = {}
+    for r in roots:
+        # If ghost root, try to get subject from first child
+        subj = ""
+        if r.message:
+            subj = r.message['norm_subj']
+        elif r.children:
+            # Find first child with message
+            q = [r]
+            while q:
+                curr = q.pop(0)
+                if curr.message:
+                    subj = curr.message['norm_subj']
+                    break
+                q.extend(curr.children)
+
+        if not subj: continue
+
+        if subj not in subj_buckets: subj_buckets[subj] = []
+        subj_buckets[subj].append(r)
+
+    # Merge roots within buckets if temporally close
+    for subj, root_list in subj_buckets.items():
+        if len(root_list) < 2: continue
+
+        # Sort roots by date
+        root_list.sort(key=lambda x: x.date)
+
+        # Try to chain them: Root1 -> Root2 if Root2 is close to Root1
+        for i in range(len(root_list) - 1):
+            parent = root_list[i]
+            child = root_list[i + 1]
+
+            # Check time delta
+            if (child.date - parent.date).days < TIME_MERGE_WINDOW_DAYS:
+                # Merge: Make 'child' a child of 'parent'
+                if child != parent:
+                    parent.add_child(child)
+
+    # --- PHASE 4: FLATTEN & SORT ---
+    print("Phase 4: Generating Thread Views...")
+
+    # Re-fetch roots after merging
+    final_roots = [n for n in nodes.values() if n.parent is None]
+
+    final_threads = []
+
+    thread_id_counter = 0
+
+    for root in final_roots:
+        # Flatten tree
+        msgs = root.walk()
+        if not msgs: continue  # Empty ghost tree
+
+        # 1. Sort Messages INSIDE Thread: Oldest First
+        msgs.sort(key=lambda x: x['dt'])
+
+        # 2. Determine Participating Folders
+        folders = set(m['folder'] for m in msgs)
+        folders_str = "||".join(sorted(folders))
+
+        # 3. Thread Metadata
+        latest_msg = msgs[-1]  # Newest message defines the thread details
+        thread_id_counter += 1
+        tid = f"t{thread_id_counter}"
+
+        # 4. Build HTML
+        html_content = ""
+        for m in msgs:
+            fpath = os.path.join(data_dir, f"{m['local_id']}.frag")
+            if os.path.exists(fpath):
+                with open(fpath, "r", encoding="utf-8") as f:
+                    html_content += f.read()
+
+        full_html = f"""
+        <!DOCTYPE html><html><head><meta charset="UTF-8">
+        <style>
+            body {{ font-family: "Geneva", sans-serif; padding: 20px; font-size: 14px; background: #fff; }}
+            pre {{ white-space: pre-wrap; font-family: Courier; }}
+            img {{ max-width: 100%; height: auto; }}
+        </style>
+        </head><body>
+        <h2 style='border-bottom: 2px solid black; padding-bottom:10px;'>Topic: {html.escape(latest_msg['subj'])}</h2>
+        {html_content}
+        </body></html>
+        """
+
+        with open(os.path.join(data_dir, f"{tid}.html"), "w", encoding="utf-8") as f:
+            f.write(full_html)
+
+        final_threads.append({
+            'tid': tid,
+            'subj': latest_msg['subj'],
+            'sender': latest_msg['sender'],
+            'date_str': latest_msg['date_str'],
+            'sort_dt': latest_msg['dt'],  # Sort thread by NEWEST message date
+            'folders': folders_str,
+            'count': len(msgs)
+        })
+
+    # 5. Sort THREADS by Newest Activity (Descending)
+    final_threads.sort(key=lambda x: x['sort_dt'], reverse=True)
+
+    # --- PHASE 5: INDEX HTML ---
     folder_html = "".join(
         [f'<div class="folder-item" onclick="filterFolder(\'{f}\')"><span>{f}</span><span>{c}</span></div>' for f, c in
          sorted(folder_counts.items())])
 
-    # Generate List Rows
     rows_html = ""
-    for e in all_emails:
+    for t in final_threads:
+        badge = f'<span class="thread-count">{t["count"]}</span>' if t["count"] > 1 else ""
         rows_html += f"""
-        <div class="mail-row" data-folder="{html.escape(e['folder'])}" onclick="loadEmail('data/{e['id']}.html', this)">
-            <div class="mail-row-date">{html.escape(e['date'][:16])}</div>
-            <div class="mail-row-sender">{html.escape(e['sender'][:35])}</div>
-            <div class="mail-row-subject">{html.escape(e['subj'])}</div>
+        <div class="mail-row" data-folders="{html.escape(t['folders'])}" onclick="loadEmail('data/{t['tid']}.html', this)">
+            <div class="mail-row-header">
+                <div class="mail-row-sender">{html.escape(t['sender'][:30])}</div>
+                <div class="mail-row-date">{html.escape(t['date_str'][:10])}</div>
+            </div>
+            <div class="mail-row-subject">
+                {html.escape(t['subj'])}{badge}
+            </div>
         </div>
         """
 
@@ -319,40 +570,39 @@ def main():
     <head><meta charset="UTF-8"><title>Mail Archive</title>{RETRO_CSS}</head>
     <body>
         <div class="window">
-            <div class="title-bar"><div class="title-text">Mail Archive - {len(all_emails)} items</div></div>
+            <div class="title-bar"><div class="title-text">{original_folder_name} Archive - {len(final_threads)} Conversations</div></div>
             <div class="main-view">
                 <div class="sidebar">
-                    <div class="folder-item active" onclick="filterFolder('all')"><span>All Mailboxes</span><span>{len(all_emails)}</span></div>
+                    <div class="folder-item active" onclick="filterFolder('all')"><span>All Mailboxes</span><span>{sum(folder_counts.values())}</span></div>
                     {folder_html}
                 </div>
                 <div class="list-pane" id="emailList">
                     {rows_html}
                 </div>
                 <div class="preview-pane">
-                    <div id="placeholder" class="preview-placeholder">Select an email to view</div>
+                    <div id="placeholder" class="preview-placeholder">Select a conversation</div>
                     <iframe id="previewFrame" name="previewFrame"></iframe>
                 </div>
             </div>
         </div>
         <script>
             function filterFolder(folderName) {{
-                // Update Sidebar UI
                 document.querySelectorAll('.folder-item').forEach(el => el.classList.remove('active'));
                 event.currentTarget.classList.add('active');
 
-                // Filter List
                 const rows = document.querySelectorAll('.mail-row');
                 rows.forEach(row => {{
-                    row.style.display = (folderName === 'all' || row.getAttribute('data-folder') === folderName) ? 'block' : 'none';
+                    const rowFolders = row.getAttribute('data-folders').split('||');
+                    if (folderName === 'all' || rowFolders.includes(folderName)) {{
+                        row.style.display = 'flex';
+                    }} else {{
+                        row.style.display = 'none';
+                    }}
                 }});
             }}
-
             function loadEmail(url, el) {{
-                // Update List UI (Selection State)
                 document.querySelectorAll('.mail-row').forEach(row => row.classList.remove('selected'));
                 el.classList.add('selected');
-
-                // Load Iframe
                 document.getElementById('placeholder').style.display = 'none';
                 const frame = document.getElementById('previewFrame');
                 frame.style.display = 'block';
@@ -365,7 +615,8 @@ def main():
 
     with open(os.path.join(output_path, "index.html"), "w", encoding="utf-8") as f:
         f.write(index_html)
-    print(f"\n✅ Done! Open: {output_path}/index.html")
+
+    print(f"Done! Created strict threaded archive at: {output_path}")
 
 
 if __name__ == "__main__":
