@@ -3,7 +3,7 @@
 
 This open-source Python utility is a specialized email archiving tool designed to convert standard Apple Mail (.mbox) exports into a high-performance, self-contained 3-column web application. It features a retro user interface (UI) inspired by early System 7 Macintosh operating systems and uses advanced threading algorithms to reconstruct conversations accurately.
 
-<img width="600" alt="Screenshot 2025-12-18 at 22 34 50" src="https://github.com/user-attachments/assets/29043996-4e87-4883-be9a-f9b51ed0638f" />
+<img width="600" alt="Screenshot 2025-12-18 at 22 35 38" src="https://github.com/user-attachments/assets/81c96d41-5880-4c1c-8cc7-f7b4ab209de6" />
 
 ---
 
